@@ -61,8 +61,8 @@ function update_script() {
 
     msg_info "Updating to ${RELEASE}"
     cd /opt/
-    wget https://github.com/paperless-ngx/paperless-ngx/releases/download/$RELEASE/paperless-ngx-$RELEASE.tar.xz &>/dev/null
-    tar -xfv paperless-ngx-$RELEASE.tar.xz
+    wget https://github.com/paperless-ngx/paperless-ngx/releases/download/$RELEASE/paperless-ngx-$RELEASE.tar.xz
+    tar -xf paperless-ngx-$RELEASE.tar.xz
     rm -R paperless-ngx-$RELEASE.tar.xz
     cd /opt/paperless-ngx
     chown -R paperless:root /opt/paperless-ngx
@@ -74,7 +74,7 @@ function update_script() {
     cp paperless-webserver.service.horst paperless-webserver.service
     cd /opt/paperless-ngx
     sudo -Hu paperless pip3 install --upgrade pip
-    pip install -r requirements.txt &>/dev/null
+    sudo -Hu paperless pip3 install -r requirements.txt
     cd /opt/paperless-ngx/src
     sudo -Hu paperless python3 manage.py migrate 
     if [ -f "$SER" ]; then
