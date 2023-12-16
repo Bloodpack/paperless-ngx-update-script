@@ -30,9 +30,6 @@ var_cpu="4"
 var_ram="8096"
 var_os="dubuntu"
 var_version="22.04"
-variables
-color
-catch_errors
 
 
 
