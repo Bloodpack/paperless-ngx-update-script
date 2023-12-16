@@ -7,6 +7,7 @@
 # Follow or contribute on GitHub here:
 # https://github.com/Bloodpack/paperless-ngx-update-script
 
+source <(curl -s https://raw.githubusercontent.com/tteck/Proxmox/main/misc/build.func)
 
 
 
