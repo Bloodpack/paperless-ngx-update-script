@@ -1,4 +1,8 @@
-#TEST
+################################
+# VERSION: 1.0 from 16.12.2023 #
+################################
+
+
 variables() {
   NSAPP=$(echo ${APP,,} | tr -d ' ') # This function sets the NSAPP variable by converting the value of the APP variable to lowercase and removing any spaces.
   var_install="${NSAPP}-install"     # sets the var_install variable by appending "-install" to the value of NSAPP.
