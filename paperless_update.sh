@@ -92,10 +92,6 @@ EOF
     msg_ok "Updated Successfully!\n"
     exit
   fi
-  if [ "$UPD" == "2" ]; then
-    cat paperless.creds
-    exit
-  fi
 }
 
 #start
