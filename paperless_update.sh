@@ -96,7 +96,7 @@ EOF
     cat paperless.creds
     exit
   fi
-
+}
 
 #start
 #build_container
