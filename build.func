@@ -1,5 +1,11 @@
+# helper for paperless-ngx update script.
+# Copyright (c) 2023 Bloodpack
+# Author: Bloodpack 
+# License: GPL-3.0 license
+# Follow or contribute on GitHub here:
+# https://github.com/Bloodpack/paperless-ngx-update-script
 ################################
-# VERSION: 1.0 from 16.12.2023 #
+# VERSION: 1.1 from 16.12.2023 #
 ################################
 
 
