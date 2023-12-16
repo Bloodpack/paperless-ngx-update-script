@@ -6,8 +6,9 @@
 # License: GPL-3.0 license
 # Follow or contribute on GitHub here:
 # https://github.com/Bloodpack/paperless-ngx-update-script
-# VERSION: 1.0 from 16.12.2023
-
+################################
+# VERSION: 1.0 from 16.12.2023 #
+################################
 
 source <(curl -s https://raw.githubusercontent.com/Bloodpack/paperless-ngx-update-script/main/build.func)
 
