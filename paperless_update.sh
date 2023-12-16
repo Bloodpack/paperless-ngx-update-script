@@ -7,7 +7,7 @@
 # Follow or contribute on GitHub here:
 # https://github.com/Bloodpack/paperless-ngx-update-script
 ################################
-# VERSION: 1.0 from 16.12.2023 #
+# VERSION: 1.1 from 16.12.2023 #
 ################################
 
 source <(curl -s https://raw.githubusercontent.com/Bloodpack/paperless-ngx-update-script/main/build.func)
@@ -67,27 +67,24 @@ function update_script() {
     wget https://github.com/paperless-ngx/paperless-ngx/releases/download/$RELEASE/paperless-ngx-$RELEASE.tar.xz
     tar -xf paperless-ngx-$RELEASE.tar.xz
     rm -R paperless-ngx-$RELEASE.tar.xz
+
     cd /opt/paperless-ngx
     chown -R paperless:root /opt/paperless-ngx
     cp paperless.conf.horst paperless.conf
+
     cd /opt/paperless-ngx/scripts/
     cp paperless-consumer.service.horst paperless-consumer.service
     cp paperless-scheduler.service.horst paperless-scheduler.service
     cp paperless-task-queue.service.horst paperless-task-queue.service
     cp paperless-webserver.service.horst paperless-webserver.service
+
     cd /opt/paperless-ngx
     sudo -Hu paperless pip3 install --upgrade pip
     sudo -Hu paperless pip3 install -r requirements.txt
     cd /opt/paperless-ngx/src
     sudo -Hu paperless python3 manage.py migrate 
-    if [ -f "$SER" ]; then
-      msg_ok "paperless-task-queue.service Exists."
-    else
-      cat <<EOF >/etc/systemd/system/paperless-task-queue.service
 
-EOF
     msg_ok "Updated to ${RELEASE}"
-
 
     msg_info "Starting Paperless-ngx"
     systemctl daemon-reload
