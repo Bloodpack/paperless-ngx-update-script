@@ -93,3 +93,4 @@ EOF
     msg_ok "Updated Successfully!\n"
     exit
   fi
+fi
