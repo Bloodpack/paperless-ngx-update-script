@@ -39,6 +39,7 @@ function update_script() {
     msg_error "No ${APP} Installation Found!"
     exit
   fi
+}
   RELEASE=$(curl -s https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest | grep "tag_name" | awk '{print substr($2, 2, length($2)-3) }')
   SER=/etc/systemd/system/paperless-task-queue.service
 
@@ -92,4 +93,3 @@ EOF
     msg_ok "Updated Successfully!\n"
     exit
   fi
-}
