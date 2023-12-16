@@ -62,8 +62,8 @@ function update_script() {
     msg_info "Updating to ${RELEASE}"
     cd /opt/
     wget https://github.com/paperless-ngx/paperless-ngx/releases/download/$RELEASE/paperless-ngx-$RELEASE.tar.xz &>/dev/null
-    tar -xfv paperless-ngx-$RELEASE.tar.xz &>/dev/null
-    rm -R paperless-ngx-$RELEASE.tar.xz &>/dev/null
+    tar -xfv paperless-ngx-$RELEASE.tar.xz
+    rm -R paperless-ngx-$RELEASE.tar.xz
     cd /opt/paperless-ngx
     chown -R paperless:root /opt/paperless-ngx
     cp paperless.conf.horst paperless.conf
@@ -76,7 +76,7 @@ function update_script() {
     sudo -Hu paperless pip3 install --upgrade pip
     pip install -r requirements.txt &>/dev/null
     cd /opt/paperless-ngx/src
-    sudo -Hu paperless python3 manage.py migrate &>/dev/null
+    sudo -Hu paperless python3 manage.py migrate 
     if [ -f "$SER" ]; then
       msg_ok "paperless-task-queue.service Exists."
     else
