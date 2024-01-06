@@ -55,7 +55,7 @@ function update_script() {
 
   if [ "$UPD" == "1" ]; then
     msg_info "Stopping Paperless-ngx"
-    systemctl stop paperless-consumer paperless-webserver paperless-scheduler
+    systemctl stop paperless-consumer paperless-webserver paperless-scheduler paperless-webserver
     if [ -f "$SER" ]; then
       systemctl stop paperless-task-queue.service
     fi
