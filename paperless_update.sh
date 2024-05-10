@@ -64,23 +64,34 @@ function update_script() {
 
     msg_info "Updating to ${RELEASE}"
     cd /opt/
+
+    msg_info "Downloading Paperless-ngx ${RELEASE}"
     wget https://github.com/paperless-ngx/paperless-ngx/releases/download/$RELEASE/paperless-ngx-$RELEASE.tar.xz
+
+    msg_info "Unpacking Paperless-ngx ${RELEASE}"
     tar -xf paperless-ngx-$RELEASE.tar.xz
     rm -R paperless-ngx-$RELEASE.tar.xz
 
+    msg_info "Patching Paperless-ngx config"
     cd /opt/paperless-ngx
     chown -R paperless:root /opt/paperless-ngx
     cp paperless.conf.horst paperless.conf
 
+    msg_info "Patching Paperless-ngx scripts"
     cd /opt/paperless-ngx/scripts/
     cp paperless-consumer.service.horst paperless-consumer.service
     cp paperless-scheduler.service.horst paperless-scheduler.service
     cp paperless-task-queue.service.horst paperless-task-queue.service
     cp paperless-webserver.service.horst paperless-webserver.service
 
+    msg_info "Upgrading PIP"
     cd /opt/paperless-ngx
     sudo -Hu paperless pip3 install --upgrade pip
+
+    msg_info "Installing requirements"
     sudo -Hu paperless pip3 install -r requirements.txt
+
+    msg_info "Migrating to new Version"
     cd /opt/paperless-ngx/src
     sudo -Hu paperless python3 manage.py migrate 
 
