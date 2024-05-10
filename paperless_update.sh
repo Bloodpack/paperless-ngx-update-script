@@ -72,7 +72,7 @@ function update_script() {
     tar -xf paperless-ngx-$RELEASE.tar.xz
     rm -R paperless-ngx-$RELEASE.tar.xz
 
-    msg_info "Patching Paperless-ngx config"
+    msg_info "Patching Paperless-ngx config" \
     cd /opt/paperless-ngx
     chown -R paperless:root /opt/paperless-ngx
     cp paperless.conf.horst paperless.conf
