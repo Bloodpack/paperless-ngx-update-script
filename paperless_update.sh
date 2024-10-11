@@ -86,10 +86,10 @@ function update_script() {
 
     msg_info "Upgrading PIP"
     cd /opt/paperless-ngx
-    sudo -Hu paperless pip3 install --upgrade pip
+    sudo -Hu paperless pip3 install --upgrade pip --break-system-packages
 
     msg_info "Installing requirements"
-    sudo -Hu paperless pip3 install -r requirements.txt
+    sudo -Hu paperless pip3 install -r requirements.txt --break-system-packages
 
     msg_info "Migrating to new Version"
     cd /opt/paperless-ngx/src
