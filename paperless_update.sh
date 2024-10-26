@@ -7,10 +7,8 @@
 # Follow or contribute on GitHub here:
 # https://github.com/Bloodpack/paperless-ngx-update-script
 ################################
-# VERSION: 1.2 from 26.10.2024 #
+# VERSION: 1.3 from 26.10.2024 #
 ################################
-
-source <(curl -s https://raw.githubusercontent.com/Bloodpack/paperless-ngx-update-script/main/build.func)
 
 function header_info {
   clear
@@ -24,22 +22,30 @@ function header_info {
 EOF
 }
 
+function msg_info {
+  echo -e "\e[32m[INFO] $1\e[0m" # Green text for info messages
+}
+
+function msg_error {
+  echo -e "\e[31m[ERROR] $1\e[0m" # Red text for error messages
+}
+
+function msg_ok {
+  echo -e "\e[34m[OK] $1\e[0m" # Blue text for success messages
+}
+
+function update_script {
+  if [[ ! -d /opt/paperless-ngx ]]; then
+    msg_error "No Paperless-ngx Installation Found!"
+    exit 1
+  fi
+}
+
 header_info
 echo -e "Loading..."
 APP="Paperless-ngx"
 RELEASE=$(curl -s https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest | grep "tag_name" | awk '{print substr($2, 2, length($2)-3) }')
 SER=/etc/systemd/system/paperless-task-queue.service
-
-function msg_info {
-  echo -e "\e[32m[INFO] $1\e[0m" # Green text for info messages
-}
-
-function update_script {
-  if [[ ! -d /opt/paperless-ngx ]]; then
-    msg_error "No ${APP} Installation Found!"
-    exit 1
-  fi
-}
 
 update_script
 
