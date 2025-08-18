@@ -109,6 +109,11 @@ if [ "$UPD" == "1" ]; then
   sudo -Hu paperless python3 manage.py migrate 
 
   echo
+  msg_info "Rebuilding document classifier..."
+  sudo -Hu paperless python3 manage.py document_create_classifier
+
+
+  echo
   msg_ok "Updated to version ${RELEASE} successfully."
 
   echo
