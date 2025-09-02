@@ -112,6 +112,9 @@ if [ "$UPD" == "1" ]; then
   msg_info "Rebuilding document classifier..."
   sudo -Hu paperless python3 manage.py document_create_classifier
 
+  echo
+  msg_info "Running document sanity checker..."
+  sudo -Hu paperless python3 manage.py document_sanity_checker
 
   echo
   msg_ok "Updated to version ${RELEASE} successfully."
