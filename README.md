@@ -1,33 +1,33 @@
 # Paperless-ngx Update Script
 
-Dieses Repository enthält ein Bash-Skript für die Aktualisierung einer lokalen Paperless-ngx-Installation auf einem Ubuntu-System mit einer Bare-Metal-Installation unter `/opt/paperless`.
+This repository contains a Bash script for updating a local Paperless-ngx installation on an Ubuntu system with a bare-metal setup under `/opt/paperless`.
 
-## Überblick
+## Overview
 
-Das Skript führt folgende Schritte aus:
+The script performs the following steps:
 
-- prüft, ob die benötigten Programme vorhanden sind
-- liest die installierte Version aus der lokalen Datei `/opt/paperless/src/paperless/version.py`
-- fragt über einen grafischen Dialog zwischen Update, Reparatur oder Abbruch
-- stoppt die relevanten Paperless-Dienste
-- erstellt ein Backup der Konfiguration, Datenbank und Medien
-- lädt das aktuelle GitHub-Release herunter
-- aktualisiert die Dateien im Installationsverzeichnis
-- führt `pip`, `migrate`, `collectstatic` und weitere Paperless-Operationen aus
-- startet die Dienste neu
-- zeigt den Verlauf im Live-Log an
-- räumt temporäre Dateien und Backup-Ordner auf
+- checks whether the required tools are installed
+- reads the installed version from the local file `/opt/paperless/src/paperless/version.py`
+- shows a graphical dialog with options for update, repair, or abort
+- stops the relevant Paperless services
+- creates a backup of configuration, database, and media files
+- downloads the latest GitHub release
+- updates the files in the installation directory
+- runs `pip`, `migrate`, `collectstatic`, and other Paperless-related operations
+- restarts the services
+- shows progress in a live log
+- removes temporary files and backup folders
 
-## Voraussetzungen
+## Requirements
 
-Das Skript wurde für folgende Umgebung entwickelt:
+The script was developed for the following environment:
 
 - Ubuntu 24.04 LTS
-- Paperless-ngx Installation unter `/opt/paperless`
-- Benutzer `paperless`
-- Python Virtual Environment unter `/opt/paperless/venv`
+- Paperless-ngx installation under `/opt/paperless`
+- user `paperless`
+- Python virtual environment under `/opt/paperless/venv`
 
-Erforderliche Pakete:
+Required packages:
 
 - `bash`
 - `curl`
@@ -39,31 +39,31 @@ Erforderliche Pakete:
 
 ## Installation
 
-1. Repository klonen oder die Datei `paperless_update.sh` herunterladen.
-2. Ausführbar machen:
+1. Clone the repository or download the file `paperless_update.sh`.
+2. Make it executable:
 
 ```bash
 chmod +x paperless_update.sh
 ```
 
-3. Als Root ausführen:
+3. Run it as root:
 
 ```bash
 sudo ./paperless_update.sh
 ```
 
-## Hinweise zur Nutzung
+## Usage Notes
 
-- Das Skript ist auf die hier beschriebene Struktur ausgelegt und wurde für genau diese Installation entwickelt.
-- Vor dem Einsatz sollte man eine eigene Sicherheitsprüfung durchführen.
-- Es ist sinnvoll, vor dem ersten Einsatz zunächst die Datei zu prüfen und die Pfade bei Bedarf anzupassen.
+- The script is designed for the structure described here and was developed for this specific installation.
+- You should perform your own security review before using it.
+- It is advisable to review the script and adjust paths if needed before first use.
 
-## Haftungsausschluss
+## Disclaimer
 
-Dieses Skript wird ohne jegliche Gewährleistung bereitgestellt. Es wird ausschließlich zu Demonstrations- und Administrationszwecken bereitgestellt.
+This script is provided without any warranty. It is provided solely for demonstration and administrative purposes.
 
-Ich übernehme keine Verantwortung für Schäden, Datenverluste, Ausfallzeiten oder sonstige Folgen, die durch die Ausführung dieses Skripts auf anderen Systemen oder in anderen Umgebungen entstehen. Jeder Nutzer ist allein dafür verantwortlich, die Funktionsweise des Skripts zu prüfen, die Sicherheit zu beurteilen und die geeigneten Maßnahmen für sein eigenes System zu treffen.
+I accept no responsibility for any damage, data loss, downtime, or other consequences resulting from the execution of this script on systems or in environments other than my own. Each user is solely responsible for reviewing the script, assessing its security, and taking appropriate precautions for their own system.
 
-## Lizenz
+## License
 
-Dieses Projekt steht unter der gleichen Lizenz wie das Repository, sofern keine andere Lizenz angegeben ist.
+This project is licensed under the same license as the repository, unless another license is specified.
