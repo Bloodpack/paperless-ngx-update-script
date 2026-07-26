@@ -122,8 +122,12 @@ run_as_paperless()
         fi
         set +a
         shift
+        if [ $# -gt 0 ]; then
+            cd "$1" || exit 1
+            shift
+        fi
         exec "$@"
-    ' _ "$PAPERLESS_CONFIG_FILE" "$@"
+    ' _ "$PAPERLESS_CONFIG_FILE" "$INSTALL_DIR/src" "$@"
 }
 
 
@@ -601,6 +605,16 @@ chown -R \
 "$PAPERLESS_USER:$PAPERLESS_USER" \
 "$INSTALL_DIR"
 
+
+if [[ -f "$INSTALL_DIR/.env" ]]; then
+    chown "$PAPERLESS_USER:$PAPERLESS_USER" "$INSTALL_DIR/.env"
+    chmod 600 "$INSTALL_DIR/.env"
+fi
+
+if [[ -f "$INSTALL_DIR/paperless.conf" ]]; then
+    chown "$PAPERLESS_USER:$PAPERLESS_USER" "$INSTALL_DIR/paperless.conf"
+    chmod 600 "$INSTALL_DIR/paperless.conf"
+fi
 
 
 echo 100
