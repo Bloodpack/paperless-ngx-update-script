@@ -12,6 +12,7 @@ The script performs the following steps:
 - stops the relevant Paperless services
 - creates a backup of configuration, database, and media files
 - downloads the latest GitHub release
+- removes stale files from the previous release tree while preserving data, media, consume, and configuration files
 - updates the files in the installation directory
 - runs `pip`, `migrate`, `collectstatic`, and other Paperless-related operations
 - restarts the services

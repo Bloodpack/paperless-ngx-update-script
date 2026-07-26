@@ -172,6 +172,23 @@ cleanup()
 }
 
 
+remove_old_release_files()
+{
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        error "Paperless Verzeichnis fehlt: $INSTALL_DIR"
+    fi
+
+    find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
+        ! -name '.env' \
+        ! -name 'paperless.conf' \
+        ! -name 'data' \
+        ! -name 'media' \
+        ! -name 'consume' \
+        ! -name 'venv' \
+        -exec rm -rf -- {} +
+}
+
+
 trap cleanup EXIT
 
 
@@ -509,6 +526,12 @@ fi
 
 
 echo 50
+echo "# Entferne alte Release-Dateien..."
+
+remove_old_release_files
+
+
+echo 55
 echo "# Entpacke Archiv..."
 
 
