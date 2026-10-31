@@ -2,7 +2,7 @@
 ###############################################################################
 # Paperless-ngx Update-Skript – native Installation
 # Zielsystem: /opt/paperless, PostgreSQL 18 auf Port 5433, Ubuntu 26.04
-# Backups: /opt/paperless-backup (werden NICHT automatisch gelöscht)
+# Backups: /opt/paperless-backup (maximal 3; älteste Sicherung wird entfernt)
 ###############################################################################
 set -Eeuo pipefail
 
@@ -22,6 +22,7 @@ SERVICES_STOPPED=0
 UPDATE_STARTED=0
 LIVE_LOG_PID=""
 CURRENT_BACKUP=""
+MAX_BACKUPS=3
 
 log() {
     printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGFILE"
@@ -52,6 +53,32 @@ stop_services_best_effort() {
     local service
     for service in "${SERVICES[@]}"; do
         systemctl stop "$service" || log "WARNUNG: $service konnte nicht gestoppt werden."
+    done
+}
+
+prune_old_backups() {
+    local -a backups=()
+    local i backup_path
+
+    # Nur Backup-Verzeichnisse im erwarteten Zeitstempel-Format berücksichtigen.
+    # Sortierung nach Namen entspricht wegen YYYYMMDD-HHMMSS der Chronologie.
+    mapfile -d '' -t backups < <(
+        find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d \
+            -name 'paperless-backup-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]' \
+            -printf '%f\0' | sort -z -r
+    )
+
+    if (( ${#backups[@]} <= MAX_BACKUPS )); then
+        log "Backup-Aufbewahrung: ${#backups[@]} von maximal $MAX_BACKUPS Sicherungen vorhanden."
+        return 0
+    fi
+
+    for ((i=MAX_BACKUPS; i<${#backups[@]}; i++)); do
+        backup_path="$BACKUP_DIR/${backups[i]}"
+        # Zusätzliche Pfadprüfung: ausschließlich direkte Unterverzeichnisse löschen.
+        [[ "$(dirname -- "$backup_path")" == "$BACKUP_DIR" ]] || fatal "Unsicherer Backup-Pfad; lösche nicht: $backup_path"
+        log "Backup-Aufbewahrung: entferne älteste Sicherung: $backup_path"
+        rm -rf --one-file-system -- "$backup_path" || fatal "Alte Sicherung konnte nicht gelöscht werden: $backup_path"
     done
 }
 
@@ -312,13 +339,16 @@ RSYNC_CHECK="$(rsync -aHAXnci --numeric-ids --out-format='%i %n%L' "$INSTALL_DIR
     echo "Datenbank: postgresql-$DB_NAME.dump (pg_dump -Fc; pg_restore --list erfolgreich)"
     echo "Rollen: postgresql-globals.sql"
     echo "Prüfsummen: SHA256SUMS"
-    echo "Aufbewahrung: keine automatische Löschung durch dieses Skript."
+    echo "Aufbewahrung: maximal $MAX_BACKUPS Backup-Verzeichnisse; älteste Sicherung wird nach erfolgreicher Backup-Prüfung entfernt."
     echo "Hinweis: Dieses Backup ist eine Sicherung, kein automatisch getesteter Restore."
 } > "$CURRENT_BACKUP/README.txt"
 sha256sum "$CURRENT_BACKUP/postgresql-$DB_NAME.dump" "$CURRENT_BACKUP/postgresql-globals.sql" > "$CURRENT_BACKUP/SHA256SUMS"
 sha256sum -c "$CURRENT_BACKUP/SHA256SUMS" >/dev/null || fatal "Prüfsummenprüfung des PostgreSQL-Backups fehlgeschlagen."
 chmod -R go-rwx "$CURRENT_BACKUP"
 log "Backup erstellt und geprüft: $CURRENT_BACKUP"
+# Erst nach erfolgreicher Prüfung der neuen Sicherung alte Backups entfernen.
+# So bleiben bei einem Backup-Fehler alle bisherigen Sicherungen unangetastet.
+prune_old_backups
 
 # Ab hier wurden Änderungen an der Installation begonnen. Bei Fehlern bleiben
 # alle Paperless-Dienste gestoppt, damit kein Mischzustand gestartet wird.
@@ -385,7 +415,8 @@ fi
 SERVICES_STOPPED=0
 
 log "ERFOLG: $ACTION_NAME abgeschlossen. Version: $CURRENT_VERSION -> $NEW_VERSION"
-log "Backup dauerhaft aufbewahrt unter: $CURRENT_BACKUP"
+log "Backup aufbewahrt unter: $CURRENT_BACKUP"
+log "Backup-Aufbewahrung: maximal $MAX_BACKUPS Sicherungen; älteste Sicherungen werden nach erfolgreicher Prüfung automatisch entfernt."
 
-dialog --title "Paperless-ngx erfolgreich" --msgbox "Aktion: $ACTION_NAME\nAlte Version: $CURRENT_VERSION\nNeue Version: $NEW_VERSION\n\nAlle vier Dienste laufen.\n\nBackup dauerhaft gespeichert unter:\n$CURRENT_BACKUP\n\nBackups werden nicht automatisch gelöscht." 15 80 || true
+dialog --title "Paperless-ngx erfolgreich" --msgbox "Aktion: $ACTION_NAME\nAlte Version: $CURRENT_VERSION\nNeue Version: $NEW_VERSION\n\nAlle vier Dienste laufen.\n\nBackup gespeichert unter:\n$CURRENT_BACKUP\n\nAufbewahrung: maximal $MAX_BACKUPS Backups. Das älteste wird nach erfolgreicher Backup-Prüfung automatisch gelöscht." 15 80 || true
 exit 0
