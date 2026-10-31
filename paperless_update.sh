@@ -1,901 +1,337 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
 ###############################################################################
-# Paperless-ngx Update Script
-#
-# Bare Metal Installation
-#
-# Ubuntu 24.04 LTS
-#
-# Installation:
-#   /opt/paperless
-#
-# User:
-#   paperless
-#
+# Paperless-ngx Update-Skript – native Installation
+# Angepasst für: /opt/paperless, PostgreSQL 18 (Port 5433), Ubuntu 26.04
+# Erstellt vollständige, dauerhaft aufbewahrte Backups unter /opt/paperless-backup
 ###############################################################################
-
 set -Eeuo pipefail
 
-
-############################
-# Konfiguration
-############################
-
 PAPERLESS_USER="paperless"
-
 INSTALL_DIR="/opt/paperless"
-
-VENV_DIR="/opt/paperless/venv"
-
+VENV_DIR="$INSTALL_DIR/venv"
 BACKUP_DIR="/opt/paperless-backup"
-
-TMP_DIR="/tmp/paperless-update"
-
+TMP_DIR="/tmp/paperless-update-$$"
 LOGFILE="/var/log/paperless-update.log"
-
-CLASSIFIER_LOG="/var/log/paperless_classifier.log"
-
-SANITY_CHECKER_LOG="/var/log/paperless_sanity_checker.log"
-
-REQUIREMENTS_FILE="$INSTALL_DIR/requirements.txt"
-
-MANAGE_PY="$INSTALL_DIR/src/manage.py"
-
 PAPERLESS_CONFIG_FILE="$INSTALL_DIR/paperless.conf"
-
-
-SERVICES=(
-paperless-webserver
-paperless-consumer
-paperless-task-queue
-paperless-scheduler
-)
-
-
+DB_NAME="paperlessdb"
+DB_PORT="5433"
 GITHUB_API="https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest"
 
+SERVICES=(paperless-consumer paperless-task-queue paperless-scheduler paperless-webserver)
+SERVICES_STOPPED=0
+LIVE_LOG_PID=""
+CURRENT_BACKUP=""
 
-############################
-# Farben
-############################
-
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-BLUE="\e[36m"
-RESET="\e[0m"
-
-
-############################
-# Funktionen
-############################
-
-
-log()
-{
+log() {
     printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGFILE"
 }
 
-log_to_file()
-{
-    printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOGFILE"
-}
-
-load_paperless_config()
-{
-    if [[ -f "$PAPERLESS_CONFIG_FILE" ]]; then
-        # Nur relevante Variablen aus paperless.conf lesen
-        if grep -Eq '^[[:space:]]*PAPERLESS_SECRET_KEY=' "$PAPERLESS_CONFIG_FILE"; then
-            export PAPERLESS_SECRET_KEY="$(grep -E '^[[:space:]]*PAPERLESS_SECRET_KEY=' "$PAPERLESS_CONFIG_FILE" | head -n1 | sed -E 's/^[[:space:]]*PAPERLESS_SECRET_KEY=[[:space:]]*//')"
-        fi
-
-        if grep -Eq '^[[:space:]]*PAPERLESS_TIME_ZONE=' "$PAPERLESS_CONFIG_FILE"; then
-            export PAPERLESS_TIME_ZONE="$(grep -E '^[[:space:]]*PAPERLESS_TIME_ZONE=' "$PAPERLESS_CONFIG_FILE" | head -n1 | sed -E 's/^[[:space:]]*PAPERLESS_TIME_ZONE=[[:space:]]*//')"
-        fi
+fatal() {
+    log "FEHLER: $*"
+    if command -v dialog >/dev/null 2>&1 && [[ -t 1 ]]; then
+        dialog --title "Paperless-ngx – Fehler" --msgbox "$*" 10 72 || true
     else
-        error "Paperless-Konfigurationsdatei fehlt: $PAPERLESS_CONFIG_FILE"
+        printf 'FEHLER: %s\n' "$*" >&2
     fi
+    exit 1
 }
 
-
-validate_paperless_config()
-{
-    if ! grep -Eq '^[[:space:]]*PAPERLESS_SECRET_KEY=' "$PAPERLESS_CONFIG_FILE"; then
-        error "PAPERLESS_SECRET_KEY fehlt in $PAPERLESS_CONFIG_FILE"
-    fi
-}
-
-
-run_as_paperless()
-{
-    sudo -u "$PAPERLESS_USER" bash -lc '
-        set -a
-        if [ -f "$1" ]; then
-            while IFS= read -r line; do
-                case "$line" in
-                    PAPERLESS_SECRET_KEY=*|PAPERLESS_TIME_ZONE=*)
-                        export "$line"
-                        ;;
-                esac
-            done < "$1"
+start_services() {
+    local failed=0 service
+    for service in "${SERVICES[@]}"; do
+        if ! systemctl start "$service"; then
+            log "FEHLER beim Start von $service"
+            failed=1
         fi
+    done
+    return "$failed"
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    if [[ "$SERVICES_STOPPED" -eq 1 ]]; then
+        log "Sicherheitsmaßnahme: Paperless-Dienste nach Skriptabbruch erneut starten."
+        if start_services; then
+            log "Dienste wurden durch die Fehlerbehandlung gestartet."
+        else
+            log "WARNUNG: Mindestens ein Dienst konnte durch die Fehlerbehandlung nicht gestartet werden."
+        fi
+    fi
+    if [[ -n "$LIVE_LOG_PID" ]]; then
+        kill "$LIVE_LOG_PID" 2>/dev/null || true
+        wait "$LIVE_LOG_PID" 2>/dev/null || true
+    fi
+    rm -rf -- "$TMP_DIR"
+    exit "$rc"
+}
+trap cleanup EXIT
+
+version_tuple() {
+    [[ "$1" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    printf '%d %d %d\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+}
+
+version_compare() {
+    # Rückgabe: 0 = gleich, 1 = links neuer, 2 = links älter
+    local -a a b
+    read -r -a a <<< "$(version_tuple "$1")" || return 3
+    read -r -a b <<< "$(version_tuple "$2")" || return 3
+    local i
+    for i in 0 1 2; do
+        if (( a[i] > b[i] )); then return 1; fi
+        if (( a[i] < b[i] )); then return 2; fi
+    done
+    return 0
+}
+
+get_version_from_file() {
+    local file="$1"
+    python3 - "$file" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+m = re.search(r"__version__\s*:\s*Final\[tuple\[int,\s*int,\s*int\]\]\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", text)
+if not m:
+    m = re.search(r"__version__\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", text)
+if not m:
+    raise SystemExit(1)
+print(".".join(m.groups()))
+PY
+}
+
+run_as_paperless() {
+    # paperless.conf ist eine shell-kompatible EnvironmentFile-Datei und wird
+    # unter dem unprivilegierten Paperless-Konto eingelesen.
+    sudo -u "$PAPERLESS_USER" /bin/bash -c '
+        set -Eeuo pipefail
+        set -a
+        # shellcheck disable=SC1090
+        source "$1"
         set +a
         shift
-        if [ $# -gt 0 ]; then
-            cd "$1" || exit 1
-            shift
-        fi
+        cd "$1"
+        shift
         exec "$@"
     ' _ "$PAPERLESS_CONFIG_FILE" "$INSTALL_DIR/src" "$@"
 }
 
+[[ "$EUID" -eq 0 ]] || { echo "Bitte mit sudo bzw. als root starten." >&2; exit 1; }
 
-start_live_log()
-{
-    touch "$LOGFILE"
-
-    clear
-    echo "=== Live Log ==="
-
-    tail -f "$LOGFILE" &
-    LOGVIEW_PID=$!
-}
-
-
-stop_live_log()
-{
-    if [[ -n "${LOGVIEW_PID:-}" ]]; then
-        kill "$LOGVIEW_PID" 2>/dev/null || true
-        wait "$LOGVIEW_PID" 2>/dev/null || true
-    fi
-}
-
-
-error()
-{
-    if command -v dialog >/dev/null 2>&1; then
-        dialog \
-        --title "Fehler" \
-        --msgbox "$1" \
-        10 60
-    else
-        echo "FEHLER: $1" >&2
-    fi
-
-    log "FEHLER: $1"
-
-    exit 1
-}
-
-
-
-cleanup()
-{
-    rm -rf "$TMP_DIR"
-}
-
-
-remove_old_release_files()
-{
-    if [[ ! -d "$INSTALL_DIR" ]]; then
-        error "Paperless Verzeichnis fehlt: $INSTALL_DIR"
-    fi
-
-    find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
-        ! -name '.env' \
-        ! -name 'paperless.conf' \
-        ! -name 'data' \
-        ! -name 'media' \
-        ! -name 'consume' \
-        ! -name 'venv' \
-        -exec rm -rf -- {} +
-}
-
-
-trap cleanup EXIT
-
-
-
-############################
-# Root Prüfung
-############################
-
-
-if [[ "$EUID" -ne 0 ]]; then
-
-    echo "Bitte als root ausführen."
-
-    exit 1
-
-fi
-
-
-
-############################
-# Programme prüfen
-############################
-
-
-REQUIRED=(
-curl
-jq
-wget
-tar
-rsync
-
-)
-
-
-for CMD in "${REQUIRED[@]}"
-do
-
-    if ! command -v "$CMD" >/dev/null 2>&1
-    then
-
-        echo "Fehlt: $CMD"
-
-        echo "Installieren mit:"
-        echo
-
-        echo "apt install $CMD"
-
-        exit 1
-
-    fi
-
+for cmd in curl jq tar xz rsync sudo systemctl dialog python3 sha256sum pg_dump pg_dumpall psql; do
+    command -v "$cmd" >/dev/null 2>&1 || fatal "Benötigtes Programm fehlt: $cmd"
 done
 
+[[ -d "$INSTALL_DIR" ]] || fatal "Paperless-Verzeichnis fehlt: $INSTALL_DIR"
+[[ -x "$VENV_DIR/bin/python" ]] || fatal "Python-Virtualenv fehlt: $VENV_DIR/bin/python"
+[[ -f "$INSTALL_DIR/requirements.txt" ]] || fatal "requirements.txt fehlt."
+[[ -f "$INSTALL_DIR/src/manage.py" ]] || fatal "manage.py fehlt."
+[[ -f "$INSTALL_DIR/src/paperless/version.py" ]] || fatal "Paperless-Versiondatei fehlt."
+[[ -f "$PAPERLESS_CONFIG_FILE" ]] || fatal "Konfigurationsdatei fehlt: $PAPERLESS_CONFIG_FILE"
+[[ "$(stat -c '%U' "$PAPERLESS_CONFIG_FILE")" == "$PAPERLESS_USER" ]] || fatal "paperless.conf gehört nicht dem Benutzer paperless. Bitte erst die Dateirechte prüfen."
 
+# Vorab sicherstellen, dass die Konfiguration syntaktisch als Shell-Datei lesbar ist.
+sudo -u "$PAPERLESS_USER" bash -n "$PAPERLESS_CONFIG_FILE" || fatal "paperless.conf ist nicht shell-kompatibel. Das Skript liest sie deshalb nicht ein."
 
-############################
-# Verzeichnisse prüfen
-############################
+CURRENT_VERSION="$(get_version_from_file "$INSTALL_DIR/src/paperless/version.py")" || fatal "Installierte Paperless-Version konnte nicht gelesen werden."
+[[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fatal "Unbekanntes Versionsformat: $CURRENT_VERSION"
 
+API_JSON="$(curl --fail --location --silent --show-error --retry 3 "$GITHUB_API")" || fatal "GitHub-Release-API ist nicht erreichbar."
+LATEST_VERSION="$(jq -er '.tag_name | sub("^v"; "")' <<< "$API_JSON")" || fatal "GitHub-Version konnte nicht ermittelt werden."
+[[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fatal "Unerwartetes GitHub-Versionsformat: $LATEST_VERSION"
 
-[[ -d "$INSTALL_DIR" ]] \
-|| error "Paperless Verzeichnis fehlt: $INSTALL_DIR"
+# PostgreSQL-Verbindung und Datenbank vor dem Menü prüfen.
+sudo -u postgres psql -p "$DB_PORT" -d "$DB_NAME" -Atqc 'SELECT 1' >/dev/null || fatal "PostgreSQL-Datenbank $DB_NAME auf Port $DB_PORT ist nicht erreichbar."
 
+mkdir -p "$TMP_DIR" "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
+touch "$LOGFILE"
+chmod 600 "$LOGFILE"
 
+printf '\nInstalliert: %s\nGitHub:      %s\n\n' "$CURRENT_VERSION" "$LATEST_VERSION"
 
-[[ -d "$VENV_DIR" ]] \
-|| error "Python Virtual Environment fehlt: $VENV_DIR"
+if ! command -v dialog >/dev/null 2>&1; then fatal "dialog fehlt. Installation: sudo apt install dialog"; fi
 
-[[ -x "$VENV_DIR/bin/python" ]] \
-|| error "Python-Binary fehlt: $VENV_DIR/bin/python"
+CHOICE="$(dialog --clear --title "Paperless-ngx Update" \
+    --menu "Installiert: $CURRENT_VERSION\nGitHub: $LATEST_VERSION\n\nBitte Aktion wählen:" \
+    18 78 4 \
+    1 "Update – nur wenn GitHub neuer ist" \
+    2 "Reparatur – installierte Version erneut installieren" \
+    3 "Erzwungenes Update – GitHub-Version bei gleich/neuer" \
+    4 "Abbruch" --stdout)" || exit 0
 
-[[ -f "$REQUIREMENTS_FILE" ]] \
-|| error "requirements.txt fehlt: $REQUIREMENTS_FILE"
-
-[[ -f "$MANAGE_PY" ]] \
-|| error "manage.py fehlt: $MANAGE_PY"
-
-
-mkdir -p "$TMP_DIR"
-
-
-
-log "Paperless Update gestartet"
-
-
-
-echo
-
-echo "Vorbereitung abgeschlossen"
-###############################################################################
-# Teil 2
-# Versionsprüfung
-###############################################################################
-
-
-get_version_from_file()
-{
-    run_as_paperless \
-    "$VENV_DIR/bin/python" \
-    -c "from pathlib import Path; import re; p = Path('/opt/paperless/src/paperless/version.py'); text = p.read_text(); m = re.search(r'__version__\s*[:=]\s*Final\[tuple\[int, int, int\]\]\s*=\s*\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)', text); print(f'{m.group(1)}.{m.group(2)}.{m.group(3)}') if m else ''" 2>/dev/null \
-    | tr -d '\r'
-}
-
-get_local_version()
-{
-    get_version_from_file
-}
-
-
-
-get_github_version()
-{
-
-    curl -s "$GITHUB_API" \
-    | jq -r '.tag_name' \
-    | sed 's/^v//'
-
-}
-
-
-
-###############################################################################
-# Versionen auslesen
-###############################################################################
-
-
-load_paperless_config
-validate_paperless_config
-
-CURRENT_VERSION=$(get_local_version)
-
-
-if [[ -z "$CURRENT_VERSION" ]]; then
-
-    error "Lokale Paperless-Version konnte nicht ermittelt werden."
-
-fi
-
-
-
-LATEST_VERSION=$(get_github_version)
-
-
-
-if [[ -z "$LATEST_VERSION" || "$LATEST_VERSION" == "null" ]]; then
-
-    error "GitHub-Version konnte nicht ermittelt werden."
-
-fi
-
-
-
-log_to_file "Installierte Version: $CURRENT_VERSION"
-
-log_to_file "GitHub Version: $LATEST_VERSION"
-
-
-###############################################################################
-# Versionsvergleich
-###############################################################################
-
-
-REPAIR_MODE=0
-
-
-if ! command -v dialog >/dev/null 2>&1; then
-    error "dialog ist nicht installiert. Bitte 'apt install dialog' ausführen."
-fi
-
-SELECTED_ACTION=$(dialog \
-    --clear \
-    --title "Paperless-ngx Update" \
-    --menu "Bitte wählen:\n\nInstalliert: $CURRENT_VERSION\nGitHub: $LATEST_VERSION" \
-    16 70 3 \
-    1 "Update" \
-    2 "Reparatur" \
-    3 "Abbruch" \
-    --stdout)
-
-case "$SELECTED_ACTION" in
+case "$CHOICE" in
     1)
-        if [[ "$CURRENT_VERSION" == "$LATEST_VERSION" ]]; then
-            REPAIR_MODE=1
-            log_to_file "Keine neue Version verfügbar, Reparaturlauf wird verwendet"
-        else
-            REPAIR_MODE=0
-            log_to_file "Benutzer hat Update gewählt"
+        version_compare "$LATEST_VERSION" "$CURRENT_VERSION" || cmp=$?
+        cmp=${cmp:-0}
+        if [[ "$cmp" -eq 2 ]]; then fatal "GitHub ($LATEST_VERSION) ist älter als installiert ($CURRENT_VERSION). Downgrade wird verhindert."; fi
+        if [[ "$cmp" -eq 0 ]]; then
+            dialog --title "Kein Update verfügbar" --msgbox "Paperless ist bereits auf Version $CURRENT_VERSION.\n\nFür eine erneute Installation derselben GitHub-Version bitte 'Erzwungenes Update' wählen." 9 72 || true
+            exit 0
         fi
+        TARGET_VERSION="$LATEST_VERSION"
+        ACTION_NAME="Normales Update"
         ;;
     2)
-        REPAIR_MODE=1
-        log_to_file "Benutzer hat Reparatur gewählt"
+        TARGET_VERSION="$CURRENT_VERSION"
+        ACTION_NAME="Reparatur"
         ;;
     3)
-        log_to_file "Benutzer hat Abbruch gewählt"
-        exit 0
+        version_compare "$LATEST_VERSION" "$CURRENT_VERSION" || cmp=$?
+        cmp=${cmp:-0}
+        if [[ "$cmp" -eq 2 ]]; then fatal "GitHub ($LATEST_VERSION) ist älter als installiert ($CURRENT_VERSION). Downgrade wird verhindert."; fi
+        TARGET_VERSION="$LATEST_VERSION"
+        ACTION_NAME="Erzwungenes Update"
         ;;
-    *)
-        log_to_file "Dialog abgebrochen"
-        exit 0
-        ;;
+    4) exit 0 ;;
+    *) exit 0 ;;
 esac
 
-# Live Log Fenster starten
-start_live_log
-sleep 1
+log "Aktion: $ACTION_NAME | Installiert: $CURRENT_VERSION | Ziel: $TARGET_VERSION"
 
-if [[ "$REPAIR_MODE" -eq 1 ]]; then
-    log "Reparaturlauf gestartet"
-else
-    log "Update wird vorbereitet..."
+# Release herunterladen und vollständig prüfen, BEVOR die Installation angefasst wird.
+ARCHIVE="$TMP_DIR/paperless-ngx-v${TARGET_VERSION}.tar.xz"
+DOWNLOAD_URL="https://github.com/paperless-ngx/paperless-ngx/releases/download/v${TARGET_VERSION}/paperless-ngx-v${TARGET_VERSION}.tar.xz"
+log "Lade Release $TARGET_VERSION herunter."
+curl --fail --location --silent --show-error --retry 3 "$DOWNLOAD_URL" -o "$ARCHIVE" || fatal "Release-Download fehlgeschlagen: $DOWNLOAD_URL"
+[[ -s "$ARCHIVE" ]] || fatal "Heruntergeladenes Archiv ist leer."
+xz -t "$ARCHIVE" || fatal "Das heruntergeladene Archiv besteht den xz-Integritätstest nicht."
+
+# Pfad-Traversal-Einträge ablehnen, bevor tar entpackt.
+if tar -tf "$ARCHIVE" | awk 'BEGIN{bad=0} /^\// {bad=1} /(^|\/)\.\.(\/|$)/ {bad=1} END{exit bad?0:1}'; then
+    fatal "Das Release-Archiv enthält unzulässige Pfade."
+fi
+mkdir -p "$TMP_DIR/extract"
+tar -xf "$ARCHIVE" -C "$TMP_DIR/extract"
+mapfile -t TOP_DIRS < <(find "$TMP_DIR/extract" -mindepth 1 -maxdepth 1 -type d -print)
+[[ "${#TOP_DIRS[@]}" -eq 1 ]] || fatal "Im Archiv wurde nicht genau ein Release-Hauptverzeichnis gefunden."
+NEW_SOURCE="${TOP_DIRS[0]}"
+[[ -f "$NEW_SOURCE/src/paperless/version.py" && -f "$NEW_SOURCE/requirements.txt" ]] || fatal "Das entpackte Release hat nicht die erwartete Paperless-Struktur."
+ARCHIVE_VERSION="$(get_version_from_file "$NEW_SOURCE/src/paperless/version.py")" || fatal "Version im Release-Archiv konnte nicht ermittelt werden."
+[[ "$ARCHIVE_VERSION" == "$TARGET_VERSION" ]] || fatal "Versionsabweichung: angefordert $TARGET_VERSION, Archiv enthält $ARCHIVE_VERSION."
+
+# Backup-Ziel eindeutig und dauerhaft anlegen.
+BACKUP_TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
+CURRENT_BACKUP="$BACKUP_DIR/paperless-backup-$BACKUP_TIMESTAMP"
+mkdir -m 700 "$CURRENT_BACKUP"
+
+# Live-Log in separatem Terminalbereich starten, falls ein Terminal vorhanden ist.
+if [[ -t 1 ]]; then
+    clear
+    echo "=== Paperless-ngx Update – Live-Log ==="
+    tail -n 20 -f "$LOGFILE" &
+    LIVE_LOG_PID=$!
 fi
 
-log "Von: $CURRENT_VERSION"
-log "Auf: $LATEST_VERSION"
-
-sleep 2
-###############################################################################
-# Teil 3
-# Backup und Programmdateien aktualisieren
-###############################################################################
-
-
-(
-echo 5
-echo "# Stoppe Paperless-Dienste..."
-log "Stoppe Paperless-Dienste"
-
-for SERVICE in "${SERVICES[@]}"
-do
-    log "Stoppe Dienst: $SERVICE"
-    systemctl stop "$SERVICE"
+log "Stoppe Paperless-Dienste für konsistentes Backup."
+# Bereits beim ersten Stop-Versuch aktivieren, damit ein Teilfehler
+# ebenfalls zum erneuten Start aller Dienste in cleanup() führt.
+SERVICES_STOPPED=1
+for service in "${SERVICES[@]}"; do
+    systemctl stop "$service" || fatal "Dienst $service konnte nicht gestoppt werden."
 done
 
-
-sleep 2
-
-
-###############################################################################
-# Backup erstellen
-###############################################################################
-
-echo 15
-echo "# Erstelle Backup..."
-
-
-BACKUP_TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
-
-CURRENT_BACKUP="${BACKUP_DIR}-${BACKUP_TIMESTAMP}"
-
-
-mkdir -p "$CURRENT_BACKUP"
-
-
-
-# Konfiguration sichern
-
-cp \
-"$INSTALL_DIR/.env" \
-"$CURRENT_BACKUP/" 2>/dev/null || true
-
-
-
-cp \
-"$INSTALL_DIR/paperless.conf" \
-"$CURRENT_BACKUP/" 2>/dev/null || true
-
-
-
-# Datenbank sichern
-
-if [[ -f "$INSTALL_DIR/data/db.sqlite3" ]]
-then
-
-    cp \
-    "$INSTALL_DIR/data/db.sqlite3" \
-    "$CURRENT_BACKUP/"
-
-fi
-
-
-
-# wichtige Datenverzeichnisse
-
-rsync -a \
-"$INSTALL_DIR/data/" \
-"$CURRENT_BACKUP/data/"
-
-
-rsync -a \
-"$INSTALL_DIR/media/" \
-"$CURRENT_BACKUP/media/"
-
-
-
-log "Backup erstellt: $CURRENT_BACKUP"
-
-
-
-###############################################################################
-# Release herunterladen
-###############################################################################
-
-
-echo 35
-echo "# Lade Paperless Release herunter..."
-
-
-
-DOWNLOAD_URL="https://github.com/paperless-ngx/paperless-ngx/releases/download/v${LATEST_VERSION}/paperless-ngx-v${LATEST_VERSION}.tar.xz"
-
-
-
-wget \
--q \
--O "$TMP_DIR/paperless.tar.xz" \
-"$DOWNLOAD_URL"
-
-
-
-if [[ ! -s "$TMP_DIR/paperless.tar.xz" ]]
-then
-
-    echo 100
-
-    error "Download fehlgeschlagen."
-
-fi
-
-
-
-###############################################################################
-# Entpacken
-###############################################################################
-
-
-echo 50
-echo "# Entferne alte Release-Dateien..."
-
-remove_old_release_files
-
-
-echo 55
-echo "# Entpacke Archiv..."
-
-
-
-mkdir -p "$TMP_DIR/extract"
-
-
-
-tar xf \
-"$TMP_DIR/paperless.tar.xz" \
--C "$TMP_DIR/extract"
-
-
-
-NEW_SOURCE=$(find \
-"$TMP_DIR/extract" \
--mindepth 1 \
--maxdepth 1 \
--type d \
-| head -n1)
-
-
-
-if [[ -z "$NEW_SOURCE" ]]
-then
-
-    error "Entpacktes Release nicht gefunden."
-
-fi
-
-
-
-###############################################################################
-# Dateien aktualisieren
-###############################################################################
-
-
-echo 70
-echo "# Aktualisiere Paperless Dateien..."
-
-
-
-rsync -a \
---exclude=data \
---exclude=media \
---exclude=consume \
---exclude=export \
---exclude=venv \
---exclude=.env \
---exclude=paperless.conf \
-"$NEW_SOURCE/" \
-"$INSTALL_DIR/"
-
-
-
-###############################################################################
-# Besitzer korrigieren
-###############################################################################
-
-
-echo 90
-echo "# Setze Dateirechte..."
-
-
-
-chown -R \
-"$PAPERLESS_USER:$PAPERLESS_USER" \
-"$INSTALL_DIR"
-
-
+# Vollständige Dateikopie inklusive venv, Konfiguration, Daten, Medien und Consume.
+log "Erstelle vollständiges Dateibackup nach $CURRENT_BACKUP/filesystem."
+mkdir "$CURRENT_BACKUP/filesystem"
+rsync -aHAX --numeric-ids "$INSTALL_DIR/" "$CURRENT_BACKUP/filesystem/" || fatal "Dateibackup fehlgeschlagen."
+
+# PostgreSQL-Backup: custom-format DB-Dump plus Rollen/Globaleinstellungen.
+log "Sichere PostgreSQL-Datenbank $DB_NAME auf Port $DB_PORT."
+sudo -u postgres pg_dump -Fc -p "$DB_PORT" -d "$DB_NAME" > "$CURRENT_BACKUP/postgresql-$DB_NAME.dump" || fatal "PostgreSQL-Datenbankdump fehlgeschlagen."
+sudo -u postgres pg_dumpall --globals-only -p "$DB_PORT" > "$CURRENT_BACKUP/postgresql-globals.sql" || fatal "PostgreSQL-Rollenbackup fehlgeschlagen."
+[[ -s "$CURRENT_BACKUP/postgresql-$DB_NAME.dump" && -s "$CURRENT_BACKUP/postgresql-globals.sql" ]] || fatal "PostgreSQL-Backup ist unvollständig."
+
+{
+    echo "Paperless-ngx Backup"
+    echo "Zeitpunkt: $(date --iso-8601=seconds)"
+    echo "Installierte Version: $CURRENT_VERSION"
+    echo "Zielversion: $TARGET_VERSION"
+    echo "Aktion: $ACTION_NAME"
+    echo "Installationsverzeichnis: $INSTALL_DIR"
+    echo "Datenbank: $DB_NAME"
+    echo "PostgreSQL-Port: $DB_PORT"
+    echo "Dateien: filesystem/ (vollständige Kopie von $INSTALL_DIR)"
+    echo "Datenbank: postgresql-$DB_NAME.dump (pg_dump -Fc)"
+    echo "Rollen: postgresql-globals.sql"
+    echo "Dieses Backup wird vom Skript NICHT automatisch gelöscht."
+} > "$CURRENT_BACKUP/README.txt"
+sha256sum "$CURRENT_BACKUP/postgresql-$DB_NAME.dump" "$CURRENT_BACKUP/postgresql-globals.sql" > "$CURRENT_BACKUP/SHA256SUMS"
+chmod -R go-rwx "$CURRENT_BACKUP"
+log "Backup erfolgreich erstellt: $CURRENT_BACKUP"
+
+# Alte Programmdateien entfernen, persistente Verzeichnisse behalten.
+# Entspricht der offiziellen Bare-Metal-Anleitung; export/log bleiben ebenfalls erhalten.
+log "Entferne alte Release-Dateien (Daten, Medien, Consume, venv, Export und Logs bleiben erhalten)."
+find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
+    ! -name '.env' \
+    ! -name 'paperless.conf' \
+    ! -name 'data' \
+    ! -name 'media' \
+    ! -name 'consume' \
+    ! -name 'venv' \
+    ! -name 'export' \
+    ! -name 'log' \
+    -exec rm -rf -- {} +
+
+log "Kopiere geprüfte Release-Dateien nach $INSTALL_DIR."
+rsync -a --chown="$PAPERLESS_USER:$PAPERLESS_USER" \
+    --exclude='data' --exclude='media' --exclude='consume' --exclude='export' \
+    --exclude='venv' --exclude='.env' --exclude='paperless.conf' --exclude='log' \
+    "$NEW_SOURCE/" "$INSTALL_DIR/" || fatal "Kopieren der Release-Dateien fehlgeschlagen."
+
+# Sicherstellen, dass Paperless-Konfiguration und Virtualenv nicht überschrieben wurden.
+[[ -f "$PAPERLESS_CONFIG_FILE" && -x "$VENV_DIR/bin/python" ]] || fatal "Konfiguration oder Virtualenv fehlt nach dem Dateiaustausch."
+chown "$PAPERLESS_USER:$PAPERLESS_USER" "$PAPERLESS_CONFIG_FILE"
+chmod 600 "$PAPERLESS_CONFIG_FILE"
 if [[ -f "$INSTALL_DIR/.env" ]]; then
     chown "$PAPERLESS_USER:$PAPERLESS_USER" "$INSTALL_DIR/.env"
     chmod 600 "$INSTALL_DIR/.env"
 fi
 
-if [[ -f "$INSTALL_DIR/paperless.conf" ]]; then
-    chown "$PAPERLESS_USER:$PAPERLESS_USER" "$INSTALL_DIR/paperless.conf"
-    chmod 600 "$INSTALL_DIR/paperless.conf"
+log "Aktualisiere Python-Abhängigkeiten."
+run_as_paperless "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel || fatal "pip/setuptools/wheel konnten nicht aktualisiert werden. Backup: $CURRENT_BACKUP"
+run_as_paperless "$VENV_DIR/bin/python" -m pip install --upgrade -r "$INSTALL_DIR/requirements.txt" || fatal "Python-Abhängigkeiten konnten nicht installiert werden. Backup: $CURRENT_BACKUP"
+
+log "Führe Datenbankmigrationen aus."
+run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" migrate --noinput || fatal "Datenbankmigration fehlgeschlagen. Backup: $CURRENT_BACKUP"
+
+log "Erzeuge statische Dateien."
+run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" collectstatic --noinput || fatal "collectstatic fehlgeschlagen. Backup: $CURRENT_BACKUP"
+
+log "Aktualisiere Suchindex (falls erforderlich)."
+run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" document_index reindex --if-needed || fatal "Suchindex-Aktualisierung fehlgeschlagen. Backup: $CURRENT_BACKUP"
+
+log "Migriere LLM-Index (falls aktiviert/konfiguriert)."
+run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" document_llmindex migrate || fatal "LLM-Index-Migration fehlgeschlagen. Backup: $CURRENT_BACKUP"
+
+log "Aktualisiere den Paperless-Klassifikator."
+if ! run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" document_create_classifier >> "$LOGFILE" 2>&1; then
+    log "WARNUNG: document_create_classifier ist fehlgeschlagen; Details stehen im Update-Log."
 fi
 
-
-echo 100
-echo "# Dateien aktualisiert"
-
-
-
-)
-
-
-log "Programmdateien aktualisiert"
-###############################################################################
-# Teil 4
-# Python Umgebung aktualisieren
-# Migrationen
-# Dienste starten
-###############################################################################
-
-
-(
-echo 5
-echo "# Aktualisiere Python-Abhängigkeiten..."
-
-
-
-sudo -u "$PAPERLESS_USER" \
-"$VENV_DIR/bin/python" -m pip install \
---upgrade pip setuptools wheel
-
-
-
-sudo -u "$PAPERLESS_USER" \
-"$VENV_DIR/bin/python" -m pip install \
--r "$INSTALL_DIR/requirements.txt"
-
-
-
-if [[ $? -ne 0 ]]
-then
-
-    echo 100
-
-    error "Python-Abhängigkeiten konnten nicht aktualisiert werden."
-
-fi
-
-
-
-###############################################################################
-# Datenbank Migrationen
-###############################################################################
-
-
-echo 30
-echo "# Führe Datenbankmigrationen aus..."
-
-
-
-run_as_paperless \
-"$VENV_DIR/bin/python" \
-"$INSTALL_DIR/src/manage.py" \
-migrate \
---noinput
-
-
-
-if [[ $? -ne 0 ]]
-then
-
-    echo 100
-
-    error "Datenbankmigration fehlgeschlagen."
-
-fi
-
-
-
-###############################################################################
-# Static Dateien
-###############################################################################
-
-
-echo 55
-echo "# Erzeuge statische Dateien..."
-
-
-
-run_as_paperless \
-"$VENV_DIR/bin/python" \
-"$INSTALL_DIR/src/manage.py" \
-collectstatic \
---noinput
-
-
-
-if [[ $? -ne 0 ]]
-then
-
-    echo 100
-
-    error "Collectstatic fehlgeschlagen."
-
-fi
-
-
-
-###############################################################################
-# Dokumentenindex aktualisieren
-###############################################################################
-
-
-echo 75
-echo "# Aktualisiere Suchindex und führe Checks aus..."
-
-
-touch "$CLASSIFIER_LOG" "$SANITY_CHECKER_LOG"
-
-if ! run_as_paperless \
-"$VENV_DIR/bin/python" \
-"$INSTALL_DIR/src/manage.py" \
-document_create_classifier >>"$CLASSIFIER_LOG" 2>&1
-then
-    log "document_create_classifier fehlgeschlagen - siehe $CLASSIFIER_LOG"
-fi
-
-if ! run_as_paperless \
-"$VENV_DIR/bin/python" \
-"$INSTALL_DIR/src/manage.py" \
-document_sanity_checker >>"$SANITY_CHECKER_LOG" 2>&1
-then
-    log "document_sanity_checker fehlgeschlagen - siehe $SANITY_CHECKER_LOG"
-fi
-
-run_as_paperless \
-"$VENV_DIR/bin/python" \
-"$INSTALL_DIR/src/manage.py" \
-document_index \
-reindex \
-|| true
-
-
-
-###############################################################################
-# Dienste starten
-###############################################################################
-
-
-echo 90
-echo "# Starte Paperless-Dienste..."
-
-
-
-for SERVICE in "${SERVICES[@]}"
-do
-
-    systemctl start "$SERVICE"
-
-done
-
-
-
-echo 100
-echo "# Update abgeschlossen"
-
-
-
-)
-
-
-log "Migrationen und Neustart abgeschlossen"
-###############################################################################
-# Teil 5
-# Abschlussprüfung
-###############################################################################
-
-
-###############################################################################
-# Dienste prüfen
-###############################################################################
+log "Starte Paperless-Dienste."
+start_services || fatal "Mindestens ein Paperless-Dienst konnte nicht gestartet werden. Backup: $CURRENT_BACKUP"
 
 FAILED_SERVICES=()
-
-
-for SERVICE in "${SERVICES[@]}"
-do
-
-    if systemctl is-active --quiet "$SERVICE"
-    then
-
-        log "Dienst läuft: $SERVICE"
-
-    else
-
-        FAILED_SERVICES+=("$SERVICE")
-
-        log "Dienst FEHLER: $SERVICE"
-
-    fi
-
+for service in "${SERVICES[@]}"; do
+    systemctl is-active --quiet "$service" || FAILED_SERVICES+=("$service")
 done
+if [[ "${#FAILED_SERVICES[@]}" -gt 0 ]]; then
+    fatal "Folgende Dienste laufen nicht: ${FAILED_SERVICES[*]}. Backup: $CURRENT_BACKUP"
+fi
+SERVICES_STOPPED=0
 
+NEW_VERSION="$(get_version_from_file "$INSTALL_DIR/src/paperless/version.py")" || fatal "Neue Version konnte nach der Installation nicht gelesen werden."
+[[ "$NEW_VERSION" == "$TARGET_VERSION" ]] || fatal "Nachprüfung fehlgeschlagen: installiert $NEW_VERSION, erwartet $TARGET_VERSION."
 
+log "ERFOLG: $ACTION_NAME abgeschlossen. Version: $CURRENT_VERSION -> $NEW_VERSION"
+log "Backup dauerhaft aufbewahrt unter: $CURRENT_BACKUP"
 
-###############################################################################
-# Ergebnis anzeigen
-###############################################################################
-
-
-if [[ ${#FAILED_SERVICES[@]} -gt 0 ]]
-then
-
-
-FAILED_LIST=$(printf "%s\n" "${FAILED_SERVICES[@]}")
-
-echo
-echo "Update abgeschlossen mit Fehlern."
-echo "Folgende Dienste laufen nicht:"
-printf '%s\n' "${FAILED_SERVICES[@]}"
-echo
-log "Update abgeschlossen mit Fehlern"
-
-
-
+if command -v dialog >/dev/null 2>&1; then
+    dialog --title "Paperless-ngx erfolgreich" --msgbox "Aktion: $ACTION_NAME\nAlte Version: $CURRENT_VERSION\nNeue Version: $NEW_VERSION\n\nAlle vier Dienste laufen.\n\nBackup dauerhaft gespeichert unter:\n$CURRENT_BACKUP" 14 78 || true
 else
-
-
-NEW_VERSION=$(get_version_from_file)
-
-if [[ -z "$NEW_VERSION" ]]; then
-    NEW_VERSION="$CURRENT_VERSION"
+    echo "Erfolgreich: $CURRENT_VERSION -> $NEW_VERSION"
+    echo "Backup: $CURRENT_BACKUP"
 fi
-
-echo
-echo "Update erfolgreich abgeschlossen!"
-echo "Alte Version: $CURRENT_VERSION"
-echo "Neue Version: $NEW_VERSION"
-echo "Alle Paperless-Dienste laufen."
-echo
-
-log "Update erfolgreich"
-log "Version alt: $CURRENT_VERSION"
-log "Version neu: $NEW_VERSION"
-
-
-
-fi
-
-
-
-###############################################################################
-# Aufräumen
-###############################################################################
-
-
-rm -rf "$TMP_DIR"
-
-if [[ -f "$TMP_DIR/paperless.tar.xz" ]]; then
-    rm -f "$TMP_DIR/paperless.tar.xz"
-fi
-
-if [[ -d "$TMP_DIR/extract" ]]; then
-    rm -rf "$TMP_DIR/extract"
-fi
-
-log "Temporäre Dateien entfernt"
-
-if [[ -d "$BACKUP_DIR" ]]; then
-    find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -print -exec rm -rf {} + 2>/dev/null || true
-    log "Backup-Verzeichnisse entfernt"
-fi
-
-if [[ -d "/opt" ]]; then
-    find /opt -maxdepth 1 -mindepth 1 -type d -name 'paperless-backup-*' -print -exec rm -rf {} + 2>/dev/null || true
-    log "Paperless-Backups im /opt-Ordner entfernt"
-fi
-
-log "=========================================="
-
-
-# Live Log Fenster schließen
-stop_live_log
-
 
 exit 0
