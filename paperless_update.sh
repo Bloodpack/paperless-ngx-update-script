@@ -2,7 +2,7 @@
 ###############################################################################
 # Paperless-ngx Update-Skript – native Installation
 # Zielsystem: /opt/paperless, PostgreSQL 18 auf Port 5433, Ubuntu 26.04
-# Konsolenmenü ohne dialog; keine automatische Löschung vorhandener Backups
+# Konsolenmenü ohne dialog; maximal drei geprüfte Backups werden aufbewahrt
 ###############################################################################
 set -Eeuo pipefail
 
@@ -47,6 +47,35 @@ stop_services_best_effort() {
         systemctl stop "$service" || log "WARNUNG: $service konnte nicht gestoppt werden."
     done
 }
+
+prune_old_backups() {
+    local -a backups=()
+    local backup_name
+    local remove_count
+
+    # Nur vollstaendig veroeffentlichte Backup-Verzeichnisse beruecksichtigen.
+    # Die Namen enthalten einen Zeitstempel und sind daher lexikalisch sortierbar.
+    mapfile -t backups < <(
+        find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 \
+            -type d -name 'paperless-backup-*' -printf '%f\n' | sort
+    )
+
+    if (( ${#backups[@]} <= 3 )); then
+        log "Backup-Aufbewahrung: ${#backups[@]} von maximal 3 Backups vorhanden."
+        return 0
+    fi
+
+    remove_count=$((${#backups[@]} - 3))
+    for ((i=0; i<remove_count; i++)); do
+        backup_name="${backups[i]}"
+        log "Loesche aeltestes Backup gemaess Aufbewahrungsregel: $backup_name"
+        rm -rf -- "$BACKUP_DIR/$backup_name" ||
+            fatal "Aeltestes Backup konnte nicht geloescht werden: $BACKUP_DIR/$backup_name"
+    done
+
+    log "Backup-Aufbewahrung abgeschlossen: die 3 neuesten Backups bleiben erhalten."
+}
+
 
 cleanup() {
     local rc=$?
@@ -120,6 +149,8 @@ run_as_paperless() {
 
 read_config_value() {
     local variable="$1"
+    # printenv liest nur die gewünschte Variable aus der von systemd
+    # eingelesenen Umgebung; keine Konfigurationswerte werden ausgegeben.
     systemd-run --quiet --wait --pipe --collect \
         --uid="$PAPERLESS_USER" \
         --property="EnvironmentFile=$PAPERLESS_CONFIG_FILE" \
@@ -146,12 +177,15 @@ flock -n 9 || fatal "Ein anderes Paperless-Update läuft bereits."
 [[ "$(stat -c '%U' "$PAPERLESS_CONFIG_FILE")" == "$PAPERLESS_USER" ]] ||
     fatal "paperless.conf gehört nicht dem Benutzer paperless. Bitte Dateirechte prüfen."
 
+# paperless.conf ist eine systemd-EnvironmentFile und keine Bash-Datei.
+# Die Syntax wird deshalb nicht mit bash -n geprüft oder per source geladen.
+
 CONFIG_DB_NAME="$(read_config_value PAPERLESS_DBNAME)"
 CONFIG_DB_PORT="$(read_config_value PAPERLESS_DBPORT)"
 [[ "$CONFIG_DB_NAME" == "$DB_NAME" ]] ||
-    fatal "DB_NAME im Skript stimmt nicht mit PAPERLESS_DBNAME überein."
+    fatal "DB_NAME im Skript ($DB_NAME) stimmt nicht mit PAPERLESS_DBNAME in paperless.conf ($CONFIG_DB_NAME) überein."
 [[ "$CONFIG_DB_PORT" == "$DB_PORT" ]] ||
-    fatal "DB_PORT im Skript stimmt nicht mit PAPERLESS_DBPORT überein."
+    fatal "DB_PORT im Skript ($DB_PORT) stimmt nicht mit PAPERLESS_DBPORT in paperless.conf ($CONFIG_DB_PORT) überein."
 
 CURRENT_VERSION="$(get_version_from_file "$INSTALL_DIR/src/paperless/version.py")" ||
     fatal "Installierte Paperless-Version konnte nicht gelesen werden."
@@ -165,28 +199,28 @@ LATEST_VERSION="$(jq -er '.tag_name | sub("^v"; "")' <<< "$API_JSON")" ||
 [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     fatal "Unerwartetes GitHub-Versionsformat: $LATEST_VERSION"
 
+# PostgreSQL-Verbindung vor dem Menü prüfen.
 sudo -u postgres psql -p "$DB_PORT" -d "$DB_NAME" -Atqc 'SELECT 1' >/dev/null ||
-    fatal "PostgreSQL-Datenbank ist nicht erreichbar."
+    fatal "PostgreSQL-Datenbank $DB_NAME auf Port $DB_PORT ist nicht erreichbar."
 
-[[ ! -L "$BACKUP_DIR" ]] || fatal "Backup-Verzeichnis darf kein symbolischer Link sein."
+[[ ! -L "$BACKUP_DIR" ]] || fatal "$BACKUP_DIR darf kein symbolischer Link sein."
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
-[[ "$(stat -c '%U' "$BACKUP_DIR")" == root ]] ||
-    fatal "Backup-Verzeichnis muss root gehören."
+[[ "$(stat -c '%U' "$BACKUP_DIR")" == root ]] || fatal "$BACKUP_DIR muss root gehören."
 
+# Genügend freien Platz für eine vollständige Dateikopie plus DB-Dump prüfen.
 SOURCE_BYTES="$(du -sx --block-size=1 "$INSTALL_DIR" | awk '{print $1}')"
 DB_BYTES="$(sudo -u postgres psql -p "$DB_PORT" -d "$DB_NAME" -Atqc "SELECT pg_database_size(current_database())")"
 FREE_BYTES="$(df -PB1 "$BACKUP_DIR" | awk 'NR==2 {print $4}')"
-
 [[ "$SOURCE_BYTES" =~ ^[0-9]+$ && "$DB_BYTES" =~ ^[0-9]+$ && "$FREE_BYTES" =~ ^[0-9]+$ ]] ||
-    fatal "Speicherplatz konnte nicht ermittelt werden."
-
+    fatal "Freier Speicherplatz konnte nicht zuverlässig ermittelt werden."
 REQUIRED_BYTES=$((SOURCE_BYTES + DB_BYTES + 536870912))
 if (( FREE_BYTES < REQUIRED_BYTES )); then
-    fatal "Zu wenig Speicherplatz für das Backup."
+    fatal "Zu wenig freier Speicherplatz für das Backup. Benötigt werden vorsichtshalber etwa $((REQUIRED_BYTES / 1024 / 1024)) MiB, frei sind $((FREE_BYTES / 1024 / 1024)) MiB."
 fi
 
-TMP_DIR="$(mktemp -d /tmp/paperless-update.XXXXXXXX)"
+TMP_DIR="$(mktemp -d /tmp/paperless-update.XXXXXXXX)" ||
+    fatal "Temporäres Verzeichnis konnte nicht erstellt werden."
 chmod 700 "$TMP_DIR"
 touch "$LOGFILE"
 chmod 600 "$LOGFILE"
@@ -210,7 +244,6 @@ printf '%s\n' '     GitHub-Version installieren, sofern kein Downgrade.'
 printf '\n'
 printf '%s\n' '  4) Abbrechen'
 printf '\n'
-
 while true; do
     read -r -p 'Ihre Auswahl [1-4]: ' CHOICE || exit 0
     case "$CHOICE" in
@@ -228,7 +261,7 @@ case "$CHOICE" in
         fi
         [[ "$cmp" -ne 3 ]] || fatal "Versionsvergleich fehlgeschlagen."
         [[ "$cmp" -ne 2 ]] ||
-            fatal "GitHub ist älter als installiert. Downgrade wird verhindert."
+            fatal "GitHub ($LATEST_VERSION) ist älter als installiert ($CURRENT_VERSION). Downgrade wird verhindert."
         if [[ "$cmp" -eq 0 ]]; then
             log "Kein Update verfügbar: Paperless ist bereits auf Version $CURRENT_VERSION. Für eine erneute Installation bitte Option 3 wählen."
             exit 0
@@ -248,7 +281,7 @@ case "$CHOICE" in
         fi
         [[ "$cmp" -ne 3 ]] || fatal "Versionsvergleich fehlgeschlagen."
         [[ "$cmp" -ne 2 ]] ||
-            fatal "GitHub ist älter als installiert. Downgrade wird verhindert."
+            fatal "GitHub ($LATEST_VERSION) ist älter als installiert ($CURRENT_VERSION). Downgrade wird verhindert."
         TARGET_VERSION="$LATEST_VERSION"
         ACTION_NAME="Erzwungenes Update"
         ;;
@@ -258,78 +291,68 @@ esac
 
 log "Aktion: $ACTION_NAME | Installiert: $CURRENT_VERSION | Ziel: $TARGET_VERSION"
 
+# Release vollständig herunterladen und prüfen, bevor die Installation angefasst wird.
 ARCHIVE="$TMP_DIR/paperless-ngx-v${TARGET_VERSION}.tar.xz"
 DOWNLOAD_URL="https://github.com/paperless-ngx/paperless-ngx/releases/download/v${TARGET_VERSION}/paperless-ngx-v${TARGET_VERSION}.tar.xz"
-
 log "Lade Release $TARGET_VERSION herunter."
 curl --fail --location --silent --show-error --retry 3 "$DOWNLOAD_URL" -o "$ARCHIVE" ||
-    fatal "Release-Download fehlgeschlagen."
-
+    fatal "Release-Download fehlgeschlagen: $DOWNLOAD_URL"
 [[ -s "$ARCHIVE" ]] || fatal "Heruntergeladenes Archiv ist leer."
-xz -t "$ARCHIVE" || fatal "Archiv-Integritätstest fehlgeschlagen."
-tar -tf "$ARCHIVE" > "$TMP_DIR/archive.list" ||
-    fatal "Archiv kann nicht aufgelistet werden."
+xz -t "$ARCHIVE" || fatal "Das heruntergeladene Archiv besteht den xz-Integritätstest nicht."
+tar -tf "$ARCHIVE" > "$TMP_DIR/archive.list" || fatal "Archiv kann nicht aufgelistet werden."
 
 if awk 'BEGIN{bad=0} /^\// {bad=1} /(^|\/)\.\.(\/|$)/ {bad=1} END{exit bad?0:1}' "$TMP_DIR/archive.list"; then
-    fatal "Archiv enthält unzulässige Pfade."
+    fatal "Das Release-Archiv enthält unzulässige Pfade."
 fi
 
 mkdir "$TMP_DIR/extract"
 tar --no-same-owner -xf "$ARCHIVE" -C "$TMP_DIR/extract"
-
 mapfile -t TOP_DIRS < <(find "$TMP_DIR/extract" -mindepth 1 -maxdepth 1 -type d -print)
 [[ "${#TOP_DIRS[@]}" -eq 1 ]] ||
-    fatal "Release-Hauptverzeichnis nicht eindeutig."
-
+    fatal "Im Archiv wurde nicht genau ein Release-Hauptverzeichnis gefunden."
 NEW_SOURCE="${TOP_DIRS[0]}"
 [[ -f "$NEW_SOURCE/src/paperless/version.py" && -f "$NEW_SOURCE/requirements.txt" ]] ||
-    fatal "Release-Struktur ist ungültig."
-
+    fatal "Das entpackte Release hat nicht die erwartete Paperless-Struktur."
 ARCHIVE_VERSION="$(get_version_from_file "$NEW_SOURCE/src/paperless/version.py")" ||
-    fatal "Archiv-Version konnte nicht ermittelt werden."
-
+    fatal "Version im Release-Archiv konnte nicht ermittelt werden."
 [[ "$ARCHIVE_VERSION" == "$TARGET_VERSION" ]] ||
-    fatal "Archiv-Version stimmt nicht mit der Zielversion überein."
+    fatal "Versionsabweichung: angefordert $TARGET_VERSION, Archiv enthält $ARCHIVE_VERSION."
 
+# Backup zunächst unter einem ausdrücklich unvollständigen Namen erstellen.
+# Erst nach sämtlichen Prüfungen wird es atomar als vollständiges Backup veröffentlicht.
 BACKUP_TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
 FINAL_BACKUP="$BACKUP_DIR/paperless-backup-$BACKUP_TIMESTAMP"
 CURRENT_BACKUP="$BACKUP_DIR/.paperless-backup-$BACKUP_TIMESTAMP.incomplete"
-
 [[ ! -e "$FINAL_BACKUP" && ! -e "$CURRENT_BACKUP" ]] ||
-    fatal "Backup-Verzeichnis existiert bereits."
+    fatal "Backup-Verzeichnis für diesen Zeitstempel existiert bereits."
+mkdir -m 700 "$CURRENT_BACKUP" ||
+    fatal "Temporäres Backup-Verzeichnis konnte nicht angelegt werden: $CURRENT_BACKUP"
 
-mkdir -m 700 "$CURRENT_BACKUP"
-
-log "Stoppe Paperless-Dienste."
+log "Stoppe Paperless-Dienste für konsistentes Backup."
 SERVICES_STOPPED=1
 for service in "${SERVICES[@]}"; do
-    systemctl stop "$service" ||
-        fatal "Dienst $service konnte nicht gestoppt werden."
+    systemctl stop "$service" || fatal "Dienst $service konnte nicht gestoppt werden."
 done
 
-log "Erstelle vollständiges Dateibackup."
+log "Erstelle vollständiges Dateibackup nach $CURRENT_BACKUP/filesystem."
 mkdir "$CURRENT_BACKUP/filesystem"
 rsync -aHAX --numeric-ids "$INSTALL_DIR/" "$CURRENT_BACKUP/filesystem/" ||
     fatal "Dateibackup fehlgeschlagen."
 
-log "Sichere PostgreSQL-Datenbank."
+log "Sichere PostgreSQL-Datenbank $DB_NAME auf Port $DB_PORT."
 sudo -u postgres pg_dump -Fc -p "$DB_PORT" -d "$DB_NAME" > "$CURRENT_BACKUP/postgresql-$DB_NAME.dump" ||
-    fatal "Datenbankdump fehlgeschlagen."
-
+    fatal "PostgreSQL-Datenbankdump fehlgeschlagen."
 sudo -u postgres pg_dumpall --globals-only -p "$DB_PORT" > "$CURRENT_BACKUP/postgresql-globals.sql" ||
-    fatal "Rollenbackup fehlgeschlagen."
-
+    fatal "PostgreSQL-Rollenbackup fehlgeschlagen."
 [[ -s "$CURRENT_BACKUP/postgresql-$DB_NAME.dump" && -s "$CURRENT_BACKUP/postgresql-globals.sql" ]] ||
-    fatal "Datenbankbackup ist unvollständig."
-
+    fatal "PostgreSQL-Backup ist unvollständig."
 pg_restore --list "$CURRENT_BACKUP/postgresql-$DB_NAME.dump" >/dev/null ||
-    fatal "Datenbankdump besteht die Strukturprüfung nicht."
+    fatal "PostgreSQL-Dump besteht die Strukturprüfung nicht."
 
+# Dateikopie inhaltlich gegen das Original prüfen (Checksum-Vergleich, nur lesend).
 RSYNC_CHECK="$(rsync -aHAXnci --numeric-ids --out-format='%i %n%L' "$INSTALL_DIR/" "$CURRENT_BACKUP/filesystem/" 2>&1)" ||
     fatal "Dateibackup konnte nicht verifiziert werden: $RSYNC_CHECK"
-
-[[ -z "$RSYNC_CHECK" ]] ||
-    fatal "Dateibackup weicht vom Original ab: $RSYNC_CHECK"
+[[ -z "$RSYNC_CHECK" ]] || fatal "Dateibackup weicht vom Original ab: $RSYNC_CHECK"
 
 {
     echo "Paperless-ngx Backup"
@@ -337,31 +360,37 @@ RSYNC_CHECK="$(rsync -aHAXnci --numeric-ids --out-format='%i %n%L' "$INSTALL_DIR
     echo "Installierte Version: $CURRENT_VERSION"
     echo "Zielversion: $TARGET_VERSION"
     echo "Aktion: $ACTION_NAME"
+    echo "Installationsverzeichnis: $INSTALL_DIR"
     echo "Datenbank: $DB_NAME"
     echo "PostgreSQL-Port: $DB_PORT"
+    echo "Dateien: filesystem/ (vollständige Kopie von $INSTALL_DIR einschließlich venv, Konfiguration, data, media und consume)"
+    echo "Datenbank: postgresql-$DB_NAME.dump (pg_dump -Fc; pg_restore --list erfolgreich)"
+    echo "Rollen: postgresql-globals.sql"
     echo "Prüfsummen: SHA256SUMS"
-    echo "Aufbewahrung: keine automatische Löschung vorhandener Backups."
-    echo "Hinweis: Backup ist kein automatisch getesteter Restore."
+    echo "Aufbewahrung: maximal 3 vollstaendige Backups; bei einem neuen Backup wird das aelteste geloescht."
+    echo "Hinweis: Dieses Backup ist eine Sicherung, kein automatisch getesteter Restore."
 } > "$CURRENT_BACKUP/README.txt"
 
 sha256sum "$CURRENT_BACKUP/postgresql-$DB_NAME.dump" "$CURRENT_BACKUP/postgresql-globals.sql" \
     > "$CURRENT_BACKUP/SHA256SUMS"
-
 sha256sum -c "$CURRENT_BACKUP/SHA256SUMS" >/dev/null ||
-    fatal "Prüfsummenprüfung fehlgeschlagen."
-
+    fatal "Prüfsummenprüfung des PostgreSQL-Backups fehlgeschlagen."
 chmod -R go-rwx "$CURRENT_BACKUP"
 
+# Veröffentlichung erst nach erfolgreicher Backup-Prüfung. Beide Pfade liegen
+# im selben Backup-Dateisystem; mv benennt das Verzeichnis dort atomar um.
 mv -- "$CURRENT_BACKUP" "$FINAL_BACKUP" ||
-    fatal "Geprüftes Backup konnte nicht veröffentlicht werden."
-
+    fatal "Geprüftes Backup konnte nicht endgültig umbenannt werden."
 CURRENT_BACKUP="$FINAL_BACKUP"
+
 log "Backup erstellt und geprüft: $CURRENT_BACKUP"
-log "Vorhandene Backups werden nicht automatisch gelöscht."
+# Erst nach erfolgreicher Erstellung und Prüfung des neuen Backups auf 3 begrenzen.
+prune_old_backups
 
+# Ab hier wurden Änderungen an der Installation begonnen. Bei Fehlern bleiben
+# alle Paperless-Dienste gestoppt, damit kein Mischzustand gestartet wird.
 UPDATE_STARTED=1
-
-log "Entferne alte Release-Dateien."
+log "Entferne alte Release-Dateien; persistente Verzeichnisse bleiben erhalten."
 find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
     ! -name '.env' \
     ! -name 'paperless.conf' \
@@ -373,7 +402,7 @@ find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
     ! -name 'log' \
     -exec rm -rf -- {} +
 
-log "Kopiere Release-Dateien."
+log "Kopiere geprüfte Release-Dateien nach $INSTALL_DIR."
 rsync -a --chown="$PAPERLESS_USER:$PAPERLESS_USER" \
     --exclude='/data' --exclude='/media' --exclude='/consume' --exclude='/export' \
     --exclude='/venv' --exclude='/.env' --exclude='/paperless.conf' --exclude='/log' \
@@ -381,11 +410,9 @@ rsync -a --chown="$PAPERLESS_USER:$PAPERLESS_USER" \
     fatal "Kopieren der Release-Dateien fehlgeschlagen."
 
 [[ -f "$PAPERLESS_CONFIG_FILE" && -x "$VENV_DIR/bin/python" ]] ||
-    fatal "Konfiguration oder Virtualenv fehlt."
-
+    fatal "Konfiguration oder Virtualenv fehlt nach dem Dateiaustausch."
 chown "$PAPERLESS_USER:$PAPERLESS_USER" "$PAPERLESS_CONFIG_FILE"
 chmod 600 "$PAPERLESS_CONFIG_FILE"
-
 if [[ -f "$INSTALL_DIR/.env" ]]; then
     chown "$PAPERLESS_USER:$PAPERLESS_USER" "$INSTALL_DIR/.env"
     chmod 600 "$INSTALL_DIR/.env"
@@ -405,48 +432,46 @@ run_as_paperless "$VENV_DIR/bin/python" -m pip install --upgrade -r "$INSTALL_DI
 
 log "Führe Datenbankmigrationen aus."
 run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" migrate --noinput ||
-    fatal "Datenbankmigration fehlgeschlagen. Backup: $CURRENT_BACKUP"
+    fatal "Datenbankmigration fehlgeschlagen. Dienste bleiben gestoppt. Backup: $CURRENT_BACKUP"
 
 log "Erzeuge statische Dateien."
 run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" collectstatic --noinput ||
-    fatal "collectstatic fehlgeschlagen. Backup: $CURRENT_BACKUP"
+    fatal "collectstatic fehlgeschlagen. Dienste bleiben gestoppt. Backup: $CURRENT_BACKUP"
 
-log "Aktualisiere Suchindex."
+log "Aktualisiere Suchindex (falls erforderlich)."
 run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" document_index reindex --if-needed ||
-    fatal "Suchindex-Aktualisierung fehlgeschlagen. Backup: $CURRENT_BACKUP"
+    fatal "Suchindex-Aktualisierung fehlgeschlagen. Dienste bleiben gestoppt. Backup: $CURRENT_BACKUP"
 
 log "Migriere LLM-Index."
 run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" document_llmindex migrate ||
-    fatal "LLM-Index-Migration fehlgeschlagen. Backup: $CURRENT_BACKUP"
+    fatal "LLM-Index-Migration fehlgeschlagen. Dienste bleiben gestoppt. Backup: $CURRENT_BACKUP"
 
 log "Aktualisiere den Paperless-Klassifikator."
 if ! run_as_paperless "$VENV_DIR/bin/python" "$INSTALL_DIR/src/manage.py" document_create_classifier >> "$LOGFILE" 2>&1; then
-    log "WARNUNG: Klassifikator konnte nicht aktualisiert werden."
+    log "WARNUNG: document_create_classifier ist fehlgeschlagen; Details stehen im Update-Log."
 fi
 
 NEW_VERSION="$(get_version_from_file "$INSTALL_DIR/src/paperless/version.py")" ||
-    fatal "Neue Version konnte nicht gelesen werden."
-
+    fatal "Neue Version konnte nach der Installation nicht gelesen werden. Dienste bleiben gestoppt."
 [[ "$NEW_VERSION" == "$TARGET_VERSION" ]] ||
-    fatal "Versionsprüfung fehlgeschlagen. Erwartet: $TARGET_VERSION, installiert: $NEW_VERSION."
+    fatal "Nachprüfung fehlgeschlagen: installiert $NEW_VERSION, erwartet $TARGET_VERSION. Dienste bleiben gestoppt."
 
 log "Starte Paperless-Dienste."
 start_services ||
-    fatal "Mindestens ein Paperless-Dienst konnte nicht gestartet werden. Backup: $CURRENT_BACKUP"
+    fatal "Mindestens ein Paperless-Dienst konnte nicht gestartet werden. Dienste bleiben gestoppt. Backup: $CURRENT_BACKUP"
 
 FAILED_SERVICES=()
 for service in "${SERVICES[@]}"; do
     systemctl is-active --quiet "$service" || FAILED_SERVICES+=("$service")
 done
-
 if [[ "${#FAILED_SERVICES[@]}" -gt 0 ]]; then
-    fatal "Folgende Dienste laufen nicht: ${FAILED_SERVICES[*]}. Backup: $CURRENT_BACKUP"
+    fatal "Folgende Dienste laufen nicht: ${FAILED_SERVICES[*]}. Dienste bleiben gestoppt. Backup: $CURRENT_BACKUP"
 fi
 
 SERVICES_STOPPED=0
-
 log "ERFOLG: $ACTION_NAME abgeschlossen. Version: $CURRENT_VERSION -> $NEW_VERSION"
 log "Backup aufbewahrt unter: $CURRENT_BACKUP"
+log "Backup-Aufbewahrung: maximal 3 neueste Backups bleiben erhalten."
 
 printf '\n'
 printf '%s\n' '========================================'
@@ -457,7 +482,6 @@ printf 'Alte Version : %s\n' "$CURRENT_VERSION"
 printf 'Neue Version : %s\n' "$NEW_VERSION"
 printf '%s\n' 'Alle vier Paperless-Dienste laufen.'
 printf 'Backup       : %s\n' "$CURRENT_BACKUP"
-printf '%s\n' 'Vorhandene Backups wurden nicht gelöscht.'
+printf '%s\n' 'Die 3 neuesten Backups bleiben erhalten.'
 printf '\n'
-
 exit 0
