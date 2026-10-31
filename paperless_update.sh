@@ -148,32 +148,29 @@ PYVERSION
 }
 
 run_as_paperless() {
-    # paperless.conf wird als Benutzer paperless eingelesen, damit alle
-    # PAPERLESS_*-Variablen für Django-Kommandos gesetzt sind.
-    sudo -u "$PAPERLESS_USER" /bin/bash -c '
-        set -Eeuo pipefail
-        set -a
-        source "$1"
-        set +a
-        shift
-        cd "$1"
-        shift
-        exec "$@"
-    ' _ "$PAPERLESS_CONFIG_FILE" "$INSTALL_DIR/src" "$@"
+    # systemd-run verwendet denselben EnvironmentFile-Parser wie die
+    # Paperless-Dienste. Die Konfigurationsdatei wird NICHT als Bash geladen.
+    systemd-run --quiet --wait --pipe --collect \
+        --uid="$PAPERLESS_USER" \
+        --property="EnvironmentFile=$PAPERLESS_CONFIG_FILE" \
+        --working-directory="$INSTALL_DIR/src" \
+        -- "$@"
 }
 
 read_config_value() {
     local variable="$1"
-    sudo -u "$PAPERLESS_USER" /bin/bash -c '
-        set -Eeuo pipefail
-        source "$1"
-        printf "%s" "${!2-}"
-    ' _ "$PAPERLESS_CONFIG_FILE" "$variable"
+    # printenv liest nur die gewünschte Variable aus der von systemd
+    # eingelesenen Umgebung; keine Konfigurationswerte werden ausgegeben.
+    systemd-run --quiet --wait --pipe --collect \
+        --uid="$PAPERLESS_USER" \
+        --property="EnvironmentFile=$PAPERLESS_CONFIG_FILE" \
+        --working-directory="$INSTALL_DIR" \
+        -- /usr/bin/printenv "$variable"
 }
 
 [[ "$EUID" -eq 0 ]] || { echo "Bitte mit sudo bzw. als root starten." >&2; exit 1; }
 
-for cmd in curl jq tar xz rsync sudo systemctl dialog python3 sha256sum pg_dump pg_dumpall pg_restore psql flock du df stat mktemp awk find sort dirname rm chmod chown tail; do
+for cmd in curl jq tar xz rsync sudo systemctl systemd-run dialog python3 sha256sum pg_dump pg_dumpall pg_restore psql flock du df stat mktemp awk find sort dirname rm chmod chown tail; do
     command -v "$cmd" >/dev/null 2>&1 || fatal "Benötigtes Programm fehlt: $cmd"
 done
 
@@ -190,8 +187,8 @@ flock -n 9 || fatal "Ein anderes Paperless-Update läuft bereits."
 [[ "$(stat -c '%U' "$PAPERLESS_CONFIG_FILE")" == "$PAPERLESS_USER" ]] ||
     fatal "paperless.conf gehört nicht dem Benutzer paperless. Bitte Dateirechte prüfen."
 
-sudo -u "$PAPERLESS_USER" /bin/bash -n "$PAPERLESS_CONFIG_FILE" ||
-    fatal "paperless.conf ist nicht shell-kompatibel."
+# paperless.conf ist eine systemd-EnvironmentFile und keine Bash-Datei.
+# Die Syntax wird deshalb nicht mit bash -n geprüft oder per source geladen.
 
 CONFIG_DB_NAME="$(read_config_value PAPERLESS_DBNAME)"
 CONFIG_DB_PORT="$(read_config_value PAPERLESS_DBPORT)"
